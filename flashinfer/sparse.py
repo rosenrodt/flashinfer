@@ -212,6 +212,7 @@ def _vsa_common_checks(
     causal: bool,
     pos_encoding_mode: str,
     logits_soft_cap,
+    supports_causal: bool = False,
 ) -> None:
     """Validate the arguments that are identical across all VSA backends."""
     if num_qo_heads % num_kv_heads != 0:
@@ -228,8 +229,13 @@ def _vsa_common_checks(
             "(mask / packed_mask).  Only block-level sparsity via indptr/indices "
             "or block_mask is supported."
         )
-    if causal:
+    if causal and not supports_causal:
         raise ValueError(f"{backend} backend does not support causal masking.")
+    if causal and M != N:
+        raise ValueError(
+            f"{backend} causal masking requires aligned self-attention with M == N "
+            f"(got M={M}, N={N})."
+        )
     if pos_encoding_mode != "NONE":
         raise ValueError(
             f"{backend} backend only supports pos_encoding_mode='NONE' "
@@ -250,16 +256,19 @@ def _vsa_run_core(
     out: Optional[torch.Tensor],
     lse: Optional[torch.Tensor],
     return_lse: bool,
+    causal: bool = False,
 ):
     """Shared NHD→BSHD dispatch, kernel call, and BSHD→NHD reshape for all VSA backends."""
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(q.size(-1))
 
     q_b, k_b, v_b = _vsa_reshape_qkv(q, k, v)
-    o_bsa, lse_bsa = fwd_fn(
+    args = (
         q_b,
         k_b,
         v_b,
+    )
+    kwargs = dict(
         q2k_block_index=vsa_q2k_index,
         block_sparse_num=1,  # ignored when q2k_block_nums is provided
         block_sizes=None,
@@ -267,6 +276,9 @@ def _vsa_run_core(
         softmax_scale=sm_scale,
         return_lse=True,
     )
+    if causal:
+        kwargs["causal"] = True
+    o_bsa, lse_bsa = fwd_fn(*args, **kwargs)
 
     return _vsa_finish_output(o_bsa, lse_bsa, out, lse, return_lse)
 
@@ -573,6 +585,8 @@ class BlockSparseAttentionWrapper:
             Whether to apply causal mask to the attention matrix.
             This is only effective when :attr:`custom_mask` is not provided in
             :meth:`plan`.
+            The ``vsa_sm100_blk128`` backend supports causal masking for aligned
+            self-attention where ``M == N``.
         pos_encoding_mode : str, optional
             The position encoding applied inside attention kernels, could be
             ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
@@ -870,6 +884,7 @@ class BlockSparseAttentionWrapper:
                 causal,
                 pos_encoding_mode,
                 logits_soft_cap,
+                supports_causal=True,
             )
 
             MB = M // R
@@ -931,6 +946,7 @@ class BlockSparseAttentionWrapper:
             self.R = R
             self.C = C
             self._sm_scale = sm_scale
+            self._vsa_causal = causal
             return
 
         # ---- VSA blk64 backend (BSA CuTe-DSL kernel, SM100/SM103) -----------------
@@ -1482,6 +1498,7 @@ class BlockSparseAttentionWrapper:
                 out,
                 lse,
                 return_lse,
+                self._vsa_causal,
             )
 
         # ---- VSA blk64 backend (BSA CuTe-DSL kernel, SM100/SM103) -----------------

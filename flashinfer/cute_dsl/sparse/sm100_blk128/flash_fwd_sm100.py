@@ -1,6 +1,6 @@
 # Supported features:
 # - BF16 & FP16 dtype
-# - noncausal attention
+# - noncausal and causal attention
 # - MHA, GQA, MQA
 # - hdim 64, 96, 128, (192, 128).
 # Based on the cutlass example and cute-dsl example:
@@ -29,7 +29,7 @@ from quack import copy_utils, layout_utils
 from .cute_dsl_utils import assume_tensor_aligned
 from . import utils
 from . import pipeline as pipeline_custom
-from .mask import apply_block_size_mask
+from .mask import apply_block_causal_mask, apply_block_size_mask
 from .softmax import SoftmaxSm100
 from .seqlen_info import SeqlenInfoQK
 from .block_info import BlockInfo
@@ -63,6 +63,7 @@ class FlashAttentionForwardSm100:
         use_clc_scheduler: bool = False,
         allow_empty_block_nums: bool = False,
         has_block_sizes: bool = True,
+        is_causal: bool = False,
     ):
         self.use_tma_KV = True
         # self.dtype = dtype
@@ -133,7 +134,7 @@ class FlashAttentionForwardSm100:
         )
         self.allow_empty_block_nums = allow_empty_block_nums
         self.has_block_sizes = has_block_sizes
-        self.is_causal = False
+        self.is_causal = is_causal
         self.is_local = False
         self.is_varlen_q = False
         self.use_correction_warps_for_epi = False
@@ -1799,6 +1800,17 @@ class FlashAttentionForwardSm100:
                 stage=stage,
             )
 
+            # PackGQA flattens query tokens and their GQA heads into M tiles.
+            # Recover the original token limit so the diagonal KV page can be
+            # masked without discarding Q/KV reuse across the packed tile.
+            q_block = m_block // self.qhead_per_kvhead
+            q_subblock = m_block - q_block * self.qhead_per_kvhead
+            q_limit = (
+                q_subblock * (self.m_block_size // self.qhead_per_kvhead)
+                + tidx // self.qhead_per_kvhead
+                + 1
+            )
+
             # Always acquire pipeline_sm_stats to stay in sync with correction
             pipeline_sm_stats.producer_acquire_w_index_phase(
                 stage, sm_stats_producer_phase
@@ -1826,10 +1838,21 @@ class FlashAttentionForwardSm100:
                         and logical_first >= raw_block_count
                         else mBlockSizes[n_block_first]
                     )
-                    first_mask_fn = partial(
-                        apply_block_size_mask,
-                        block_size=first_block_size,
-                        n_block_size=self.n_block_size,
+                    first_mask_fn = (
+                        partial(
+                            apply_block_causal_mask,
+                            block_size=first_block_size,
+                            n_block=n_block_first,
+                            q_block=q_block,
+                            q_limit=q_limit,
+                            n_block_size=self.n_block_size,
+                        )
+                        if const_expr(self.is_causal)
+                        else partial(
+                            apply_block_size_mask,
+                            block_size=first_block_size,
+                            n_block_size=self.n_block_size,
+                        )
                     )
                 elif const_expr(mBlockNums is not None):
                     # No block_sizes but var block nums: phantom block still needs block_size=0 mask;
@@ -1839,9 +1862,29 @@ class FlashAttentionForwardSm100:
                         if logical_first >= raw_block_count
                         else Int32(self.n_block_size)
                     )
+                    first_mask_fn = (
+                        partial(
+                            apply_block_causal_mask,
+                            block_size=first_block_size,
+                            n_block=n_block_first,
+                            q_block=q_block,
+                            q_limit=q_limit,
+                            n_block_size=self.n_block_size,
+                        )
+                        if const_expr(self.is_causal)
+                        else partial(
+                            apply_block_size_mask,
+                            block_size=first_block_size,
+                            n_block_size=self.n_block_size,
+                        )
+                    )
+                elif const_expr(self.is_causal):
                     first_mask_fn = partial(
-                        apply_block_size_mask,
-                        block_size=first_block_size,
+                        apply_block_causal_mask,
+                        block_size=Int32(self.n_block_size),
+                        n_block=n_block_first,
+                        q_block=q_block,
+                        q_limit=q_limit,
                         n_block_size=self.n_block_size,
                     )
                 else:
@@ -1860,9 +1903,29 @@ class FlashAttentionForwardSm100:
                     logical_n = logical_first - self.s_stage * (n_tile + 1)
                     n_block_cur = n_block(logical_n)
                     if const_expr(self.has_block_sizes):
+                        remaining_mask_fn = (
+                            partial(
+                                apply_block_causal_mask,
+                                block_size=mBlockSizes[n_block_cur],
+                                n_block=n_block_cur,
+                                q_block=q_block,
+                                q_limit=q_limit,
+                                n_block_size=self.n_block_size,
+                            )
+                            if const_expr(self.is_causal)
+                            else partial(
+                                apply_block_size_mask,
+                                block_size=mBlockSizes[n_block_cur],
+                                n_block_size=self.n_block_size,
+                            )
+                        )
+                    elif const_expr(self.is_causal):
                         remaining_mask_fn = partial(
-                            apply_block_size_mask,
-                            block_size=mBlockSizes[n_block_cur],
+                            apply_block_causal_mask,
+                            block_size=Int32(self.n_block_size),
+                            n_block=n_block_cur,
+                            q_block=q_block,
+                            q_limit=q_limit,
                             n_block_size=self.n_block_size,
                         )
                     else:

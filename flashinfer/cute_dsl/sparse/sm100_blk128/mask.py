@@ -55,3 +55,21 @@ def apply_block_size_mask(
             lambda s: r2p_bitmask_below(block_size, s),
             rank1=True,
         )
+
+
+@cute.jit
+def apply_block_causal_mask(
+    acc_S: cute.Tensor,
+    block_size: Int32,
+    n_block: Int32,
+    q_block: Int32,
+    q_limit: Int32,
+    n_block_size: cutlass.Constexpr[int] = 128,
+) -> None:
+    """Mask a selected page by both its live extent and causal diagonal."""
+    limit = block_size
+    if n_block > q_block:
+        limit = Int32(0)
+    elif n_block == q_block:
+        limit = min(limit, q_limit)
+    apply_block_size_mask(acc_S, limit, n_block_size)

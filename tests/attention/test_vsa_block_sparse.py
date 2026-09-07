@@ -123,13 +123,14 @@ def _bsr_to_dense_mask(
 
 def _pytorch_ref(
     q: torch.Tensor,  # [M, H, D]
-    k: torch.Tensor,  # [N, H, D]
-    v: torch.Tensor,  # [N, H, D]
+    k: torch.Tensor,  # [N, Hkv, D]
+    v: torch.Tensor,  # [N, Hkv, D]
     indptr: torch.Tensor,
     indices: torch.Tensor,
     R: int,
     C: int,
     sm_scale: float = None,
+    causal: bool = False,
 ) -> torch.Tensor:
     """Dense PyTorch reference for block-sparse attention."""
     M, H, D = q.shape
@@ -140,10 +141,17 @@ def _pytorch_ref(
 
     mask = _bsr_to_dense_mask(indptr, indices, MB, NB, R, C, q.device)
 
+    if H % k.shape[1] != 0:
+        raise ValueError("Q heads must be divisible by KV heads")
+    group_size = H // k.shape[1]
     qf = q.float().permute(1, 0, 2)  # [H, M, D]
-    kf = k.float().permute(1, 0, 2)  # [H, N, D]
-    vf = v.float().permute(1, 0, 2)  # [H, N, D]
+    kf = k.repeat_interleave(group_size, dim=1).float().permute(1, 0, 2)
+    vf = v.repeat_interleave(group_size, dim=1).float().permute(1, 0, 2)
     scores = torch.matmul(qf, kf.transpose(-1, -2)) * sm_scale  # [H, M, N]
+    if causal:
+        mask &= torch.arange(N, device=q.device).unsqueeze(0) <= torch.arange(
+            M, device=q.device
+        ).unsqueeze(1)
     scores = scores.masked_fill(~mask.unsqueeze(0), float("-inf"))
     probs = torch.softmax(scores, dim=-1)
     out = torch.matmul(probs, vf)  # [H, M, D]
@@ -238,6 +246,81 @@ def test_vsa_sm_scale(sm_scale, workspace):
     o = wrapper.run(q, k, v)
 
     torch.testing.assert_close(o_ref, o, atol=1e-2, rtol=1e-2)
+
+
+def test_vsa_causal_gqa_accuracy(workspace):
+    """Causal masking follows token positions after packed-GQA tiling."""
+    device = torch.device("cuda")
+    torch.manual_seed(2026)
+    num_blocks, num_q_heads, num_kv_heads = 4, 8, 1
+    M = N = num_blocks * R
+    q = torch.randn(M, num_q_heads, HEAD_DIM, dtype=torch.bfloat16, device=device)
+    k = torch.randn(M, num_kv_heads, HEAD_DIM, dtype=torch.bfloat16, device=device)
+    v = torch.randn_like(k)
+
+    # Rows include old, diagonal, and future pages. The odd row lengths also
+    # exercise the phantom-page path used to balance the two softmax warpgroups.
+    indptr = torch.tensor([0, 2, 5, 8, 10], dtype=torch.int32, device=device)
+    indices = torch.tensor(
+        [0, 1, 0, 1, 2, 0, 2, 3, 0, 3], dtype=torch.int32, device=device
+    )
+    o_ref = _pytorch_ref(q, k, v, indptr, indices, R, C, causal=True)
+
+    # Seed the same specialization without causal masking. Causal must have a
+    # distinct compile key or the second plan will incorrectly reuse this code.
+    noncausal_wrapper = _make_wrapper(workspace)
+    noncausal_wrapper.plan(
+        indptr,
+        indices,
+        M,
+        N,
+        R,
+        C,
+        num_q_heads,
+        num_kv_heads,
+        HEAD_DIM,
+        q_data_type=q.dtype,
+    )
+    noncausal_wrapper.run(q, k, v)
+
+    wrapper = _make_wrapper(workspace)
+    wrapper.plan(
+        indptr,
+        indices,
+        M,
+        N,
+        R,
+        C,
+        num_q_heads,
+        num_kv_heads,
+        HEAD_DIM,
+        q_data_type=q.dtype,
+        causal=True,
+    )
+    o = wrapper.run(q, k, v)
+    torch.testing.assert_close(o_ref, o, atol=1e-2, rtol=1e-2)
+
+
+def test_vsa_causal_rejects_asymmetric_sequences(workspace):
+    """Causal blk128 rejects layouts whose query origin is not KV origin."""
+    device = torch.device("cuda")
+    indptr = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    indices = torch.tensor([0], dtype=torch.int32, device=device)
+    wrapper = _make_wrapper(workspace)
+    with pytest.raises(ValueError, match="aligned self-attention"):
+        wrapper.plan(
+            indptr,
+            indices,
+            R,
+            2 * C,
+            R,
+            C,
+            8,
+            1,
+            HEAD_DIM,
+            q_data_type=torch.bfloat16,
+            causal=True,
+        )
 
 
 def test_vsa_vs_auto_80k(workspace):

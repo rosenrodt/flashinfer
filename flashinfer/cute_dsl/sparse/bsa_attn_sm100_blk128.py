@@ -80,6 +80,7 @@ def bsa_attn_sm100_blk128_fwd(
     return_lse: bool = False,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
+    causal: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for BSA block-sparse attention using the blk128 CuTe-DSL kernel.
 
@@ -102,6 +103,8 @@ def bsa_attn_sm100_blk128_fwd(
         return_lse: Whether to return log-sum-exp.
         out: Pre-allocated output tensor.
         lse: Pre-allocated LSE tensor.
+        causal: Apply token-level causal masking within selected block-128 pages.
+            This mode requires aligned self-attention (``seqlen_q == seqlen_k``).
     """
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
     batch_size, seqlen_q, num_head, head_dim = q.shape
@@ -121,6 +124,10 @@ def bsa_attn_sm100_blk128_fwd(
         f"bsa_attn_sm100_blk128_fwd only supports SM100/SM103, got SM{arch}"
     )
     assert num_head % num_head_kv == 0
+    if causal and seqlen_q != k.shape[1]:
+        raise ValueError(
+            "causal BSA requires aligned self-attention with seqlen_q == seqlen_k"
+        )
 
     assert q2k_block_index.dtype == torch.int32, "q2k_block_index must be int32"
     has_block_sizes = block_sizes is not None
@@ -190,6 +197,7 @@ def bsa_attn_sm100_blk128_fwd(
         has_variable_block_nums,
         allow_empty_block_nums and has_variable_block_nums,
         has_block_sizes,
+        causal,
     )
 
     if compile_key not in _sm100_blk128_compile_cache:
@@ -215,6 +223,7 @@ def bsa_attn_sm100_blk128_fwd(
             use_clc_scheduler=use_clc_scheduler,
             allow_empty_block_nums=allow_empty_block_nums and has_variable_block_nums,
             has_block_sizes=has_block_sizes,
+            is_causal=causal,
         )
 
         _sm100_blk128_compile_cache[compile_key] = cute.compile(
