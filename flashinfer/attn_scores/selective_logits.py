@@ -76,13 +76,19 @@ def _candidate_count_segments(split_kv: int) -> int:
 
 def _select_candidate_publication(
     split_kv: int,
+    *,
+    lane_local: bool = False,
 ) -> tuple[_CandidatePublication, int]:
     """Choose the production publisher layout for a split count.
 
-    Lane-local publication remains an internal compatibility layout. It is not
-    selected from shapes alone because score skew, and therefore its repair
-    cost, is data-dependent.
+    Prefill uses lane-local publication through four splits to preserve
+    independent candidate cursors in the long-running score kernel. Decode uses
+    compact warp-ranked stripes, then pooled segments above eight splits.
     """
+    if lane_local:
+        if split_kv > 4:
+            raise ValueError("lane-local publication supports at most four splits")
+        return "lane_local", 32 * split_kv
     if split_kv <= _MAX_STRIPED_SPLIT_KV:
         return _WARP_STRIPED_PUBLICATION, _candidate_count_segments(split_kv)
     return _WARP_POOLED_PUBLICATION, _candidate_count_segments(split_kv)
@@ -396,7 +402,10 @@ def _select_candidate_schedule(
         query_tile=tiling.next_n,
         num_sms=num_sms,
     )
-    publication, count_segments = _select_candidate_publication(split_kv)
+    publication, count_segments = _select_candidate_publication(
+        split_kv,
+        lane_local=max(q_lengths, default=0) > tiling.next_n,
+    )
     return _CandidateSchedule(
         query_tile=tiling.next_n,
         logical_n=tiling.next_n * num_heads,
@@ -412,16 +421,13 @@ def _candidate_schedule_matches_prepared(
     schedule: _CandidateSchedule,
     prepared: _PreparedFP8MQASelectiveLogits,
 ) -> bool:
-    """Check that preparation preserved every selected topology knob."""
-    publication, count_segments = _select_candidate_publication(prepared.split_kv)
+    """Check that preparation preserved every compiled topology knob."""
     return (
         schedule.query_tile == prepared.query_tile
         and schedule.logical_n == prepared.query_tile * prepared.num_heads
         and schedule.num_epi_subtiles == prepared.num_epi_subtiles
         and schedule.num_umma_stages == prepared.num_umma_stages
         and schedule.split_kv == prepared.split_kv
-        and schedule.publication == publication
-        and schedule.count_segments == count_segments
     )
 
 

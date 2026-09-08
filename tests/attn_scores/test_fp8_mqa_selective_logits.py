@@ -90,6 +90,14 @@ def test_candidate_publication_is_selected_with_split_kv(
     )
 
 
+@pytest.mark.parametrize("split_kv", (1, 2, 4))
+def test_candidate_prefill_publication_uses_lane_local_segments(split_kv):
+    assert _select_candidate_publication(split_kv, lane_local=True) == (
+        "lane_local",
+        32 * split_kv,
+    )
+
+
 def test_candidate_publication_rejects_layout_from_another_split():
     inputs = _inputs(q_rows=1, kv_rows=128)
     prepared = _prepare(inputs, split_kv=1)
@@ -1025,7 +1033,8 @@ def test_unified_wrapper_segmented_publication_query_tiles(num_heads, query_tile
         num_sms=2,
     )
     assert wrapper._candidate_prepared.query_tile == query_tile
-    assert wrapper._candidate_counts.shape[1] == 5
+    assert wrapper._candidate_schedule.publication == "lane_local"
+    assert wrapper._candidate_counts.shape[1] == 33
     selected = wrapper.run(q, kv_fused, weights, block_table).long()
     torch.cuda.synchronize()
 
@@ -1082,8 +1091,8 @@ def test_unified_wrapper_selects_split_kv_from_sm_waves(
         wrapper._candidate_schedule.query_tile == wrapper._candidate_prepared.query_tile
     )
     assert wrapper._candidate_schedule.split_kv == expected_split
-    assert wrapper._candidate_schedule.publication == "warp_striped"
-    assert wrapper._candidate_counts.shape[1] == 1 + 4 * expected_split
+    assert wrapper._candidate_schedule.publication == "lane_local"
+    assert wrapper._candidate_counts.shape[1] == 1 + 32 * expected_split
     selected = wrapper.run(q, kv_fused, weights, block_table).long()
     torch.cuda.synchronize()
 
@@ -1222,7 +1231,8 @@ def test_unified_wrapper_split_kv_handles_heterogeneous_batch():
         num_sms=3,
     )
     assert wrapper._candidate_prepared.split_kv == 2
-    assert wrapper._candidate_counts.shape[1] == 9
+    assert wrapper._candidate_schedule.publication == "lane_local"
+    assert wrapper._candidate_counts.shape[1] == 65
     selected = wrapper.run(q, kv_fused, weights, block_table).long()
     torch.cuda.synchronize()
 
