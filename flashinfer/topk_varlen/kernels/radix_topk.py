@@ -190,6 +190,7 @@ class SinglePassMultiCTARadixTopKKernel:
         num_copy_bits: int = 256,
         ctas_per_group: int = 1,
         num_sms: int = 148,
+        input_col_stride: int = 1,
     ):
         self.dtype = dtype
         self.chunk_size = chunk_size
@@ -199,6 +200,7 @@ class SinglePassMultiCTARadixTopKKernel:
         self.ctas_per_group = ctas_per_group
         self.num_sms = num_sms
         self.num_copy_bits = num_copy_bits
+        self.input_col_stride = input_col_stride
 
         # Radix config
         self.radix = 256
@@ -293,8 +295,14 @@ class SinglePassMultiCTARadixTopKKernel:
         Thread layout: thread t handles every (num_threads)-th vector in the
         aligned region (coalesced warp access).
         """
-        vec_size = cutlass.const_expr(self.vec_size)
         num_threads = cutlass.const_expr(self.num_threads)
+        if cutlass.const_expr(self.input_col_stride != 1):
+            for j in range(tidx, actual_chunk_size, num_threads):
+                shared_ordered[j] = self.to_ordered(input_row[chunk_start + j])
+            cute.arch.barrier()
+            return cutlass.Int32(0), cutlass.Int32(0), actual_chunk_size
+
+        vec_size = cutlass.const_expr(self.vec_size)
         # align_bytes and elem_bytes are compile-time Python ints
         align_bytes = self.num_copy_bits // 8
         elem_bytes = self.dtype.width // 8

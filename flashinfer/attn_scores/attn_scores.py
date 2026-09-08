@@ -82,6 +82,11 @@ _FP4_SF_INTERLEAVE_BLOCK_SIZE = 128
 # Epilogue FMA unroll granularity: both kernels assert
 # `num_heads % num_epi_subtiles == 0` and `(num_heads // num_epi_subtiles) % 4 == 0`.
 _EPI_SUBTILE_UNROLL = 4
+# The flattened epilogue needs finer default partitioning once one logical row
+# exceeds this many heads. Keeping each default subtile at most this wide
+# preserves the original one-row lowering for small head counts and avoids a
+# measured H64 regression on Blackwell Ultra.
+_DEFAULT_EPI_SUBTILE_WIDTH = 16
 # MXFP4 scale-factor block size: one UE8M0 exponent per this many FP4 values.
 _FP4_SF_VEC_SIZE = 32
 # sf_q packs the per-token scale factors of one head into a single int32, so
@@ -285,8 +290,8 @@ def _validate_schedule_meta_fresh(
 
     The schedule is a pure function of ``(context_lens, num_sms)``, so it can be
     recomputed and compared exactly.  Reuse is only valid while the whole
-    ``ceil(context_lens / _SPLIT_KV)`` vector is unchanged -- a single sequence
-    crossing a ``_SPLIT_KV`` boundary (256 -> 257) changes one row's split count
+    ``ceil(context_lens / _KV_CHUNK_SIZE)`` vector is unchanged -- a single sequence
+    crossing a ``_KV_CHUNK_SIZE`` boundary (256 -> 257) changes one row's chunk count
     from 1 to 2 while every tensor shape stays identical.
 
     A stale schedule does not merely give wrong numbers: the persistent kernel
@@ -312,9 +317,9 @@ def _validate_schedule_meta_fresh(
     if not torch.equal(expected, schedule_meta):
         raise ValueError(
             f"{fn_name}: schedule_meta does not match context_lens. It is a "
-            f"function of the whole ceil(context_lens / {_SPLIT_KV}) vector and "
+            f"function of the whole ceil(context_lens / {_KV_CHUNK_SIZE}) vector and "
             f"the device SM count, so a single sequence crossing a "
-            f"{_SPLIT_KV}-token boundary invalidates it even when every shape is "
+            f"{_KV_CHUNK_SIZE}-token boundary invalidates it even when every shape is "
             f"unchanged. Recompute it with compute_paged_mqa_logits_schedule("
             f"context_lens, out=schedule_meta); reusing a stale schedule can hang "
             f"the persistent kernel."
@@ -352,7 +357,7 @@ def _validate_out(
 ) -> None:
     """Validate a caller-provided ``out=`` buffer.
 
-    The kernel writes UNCONDITIONALLY into the SPLIT_KV-padded trailing region,
+    The kernel writes unconditionally into the 256-token-chunk-padded trailing region,
     so ``out`` must have at least ``padded_ctx_len`` columns (use
     :func:`padded_context_len`) and ``rows`` rows — otherwise the store spills
     past each row / past the buffer (silent corruption or illegal address)."""
@@ -365,7 +370,7 @@ def _validate_out(
     if out.dim() != 2 or out.shape[0] < rows or out.shape[1] < padded_ctx_len:
         raise ValueError(
             f"out must be at least ({rows}, {padded_ctx_len}); the kernel writes into "
-            f"the SPLIT_KV=256-padded trailing region. Use "
+            f"the 256-token-chunk-padded trailing region. Use "
             f"padded_context_len(max_context_len) for the column count. "
             f"Got shape {tuple(out.shape)}."
         )
@@ -662,6 +667,10 @@ def _cached_compile_fp8_kernel(
     )
     fake_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
+    logical_num_epi_subtiles = next_n * num_epi_subtiles
+    if num_epi_subtiles == 1:
+        logical_num_epi_subtiles = N // min(num_heads, _DEFAULT_EPI_SUBTILE_WIDTH)
+
     kernel = FP8MQALogitsKernel(
         block_kv=_COMPUTE_BLOCK_KV,
         phys_block_kv=block_size,  # kernel kwarg name is fixed (verbatim TRT-LLM port)
@@ -669,7 +678,9 @@ def _cached_compile_fp8_kernel(
         head_dim=head_dim,
         next_n=next_n,
         num_sms=num_sms,
-        num_epi_subtiles=num_epi_subtiles,
+        # The public knob remains per-row for compatibility; the kernel now
+        # partitions the complete logical N = next_n * num_heads tile.
+        num_epi_subtiles=logical_num_epi_subtiles,
         epi_dtype=epi_dtype,
         acc_dtype=acc_dtype,
         output_dtype=output_dtype,
@@ -822,7 +833,7 @@ def _cached_compile_fp4_kernel(
 # Public API
 # ──────────────────────────────────────────────────────────────────────────────
 
-_SPLIT_KV = _COMPUTE_BLOCK_KV * _NUM_MATH_WG  # 256 — output alignment granularity
+_KV_CHUNK_SIZE = _COMPUTE_BLOCK_KV * _NUM_MATH_WG  # 256 - output alignment granularity
 
 
 def _gpu_schedule(
@@ -843,7 +854,7 @@ def _gpu_schedule(
     with _on_device(dev_index):
         compiled = _compile_schedule_kernel(
             aligned_b,
-            _SPLIT_KV,
+            _KV_CHUNK_SIZE,
             num_sms,
             _arch_for_launch(dev_index, "compute_paged_mqa_logits_schedule"),
         )
@@ -853,14 +864,14 @@ def _gpu_schedule(
 def padded_context_len(max_context_len: int) -> int:
     """Return the minimum allocated context dimension for paged MQA logits output.
 
-    The kernel may write unconditionally into SPLIT_KV-padded trailing positions,
+    The kernel may write unconditionally into 256-token-chunk-padded trailing positions,
     so the output tensor must be allocated with at least this many columns.
 
     Use this to pre-allocate the ``out`` parameter:
         out = torch.empty((B * next_n, padded_context_len(max_ctx)), dtype=..., device="cuda")
         logits = fp8_paged_mqa_logits(..., out=out)
     """
-    return ((max_context_len + _SPLIT_KV - 1) // _SPLIT_KV) * _SPLIT_KV
+    return ((max_context_len + _KV_CHUNK_SIZE - 1) // _KV_CHUNK_SIZE) * _KV_CHUNK_SIZE
 
 
 def compute_paged_mqa_logits_schedule(
@@ -1091,7 +1102,8 @@ def fp8_paged_mqa_logits(
                          Use compute_paged_mqa_logits_schedule() to generate it.
         out:             optional pre-allocated output
                          [batch_size*next_n, padded_ctx_len], where padded_ctx_len
-                         >= max_context_len and is a multiple of SPLIT_KV=256.
+                         >= max_context_len and is a multiple of the 256-token
+                         scheduler chunk size.
                          If None, allocated each call.  Use padded_context_len()
                          to size it.  Required for CUDA graph capture.
                          May have more rows than batch_size*next_n, so one
@@ -1140,7 +1152,9 @@ def fp8_paged_mqa_logits(
     _validate_paged_bounds(
         block_table, context_lens, max_context_len, block_size, "fp8_paged_mqa_logits"
     )
-    padded_ctx_len = ((max_context_len + _SPLIT_KV - 1) // _SPLIT_KV) * _SPLIT_KV
+    padded_ctx_len = (
+        (max_context_len + _KV_CHUNK_SIZE - 1) // _KV_CHUNK_SIZE
+    ) * _KV_CHUNK_SIZE
     if out is not None:
         _validate_out(out, B * next_n, padded_ctx_len, q.device, output_dtype)
         logits = out[: B * next_n, :max_context_len]
@@ -1463,7 +1477,9 @@ def fp4_paged_mqa_logits(
     _validate_paged_bounds(
         block_table, context_lens, max_context_len, block_size, "fp4_paged_mqa_logits"
     )
-    padded_ctx_len = ((max_context_len + _SPLIT_KV - 1) // _SPLIT_KV) * _SPLIT_KV
+    padded_ctx_len = (
+        (max_context_len + _KV_CHUNK_SIZE - 1) // _KV_CHUNK_SIZE
+    ) * _KV_CHUNK_SIZE
     if out is not None:
         _validate_out(out, B * next_n, padded_ctx_len, q.device, output_dtype)
         logits = out[: B * next_n, :max_context_len]
@@ -1646,4 +1662,4 @@ def precompile_paged_mqa_logits(
         for aligned_b in sorted(
             {max(((int(b) + 31) // 32) * 32, 32) for b in (batch_sizes or ())}
         ):
-            _compile_schedule_kernel(aligned_b, _SPLIT_KV, num_sms, arch)
+            _compile_schedule_kernel(aligned_b, _KV_CHUNK_SIZE, num_sms, arch)

@@ -806,6 +806,8 @@ def _compile_radix(
     ctas_per_group,
     chunk_size,
     num_sms,
+    input_col_stride=1,
+    input_row_stride=None,
 ):
     # N (vocab size) is static: it feeds the fake input tensor's column extent so
     # the kernel is specialized per vocab width. chunk_size (the per-CTA SMEM
@@ -825,6 +827,7 @@ def _compile_radix(
         compress_ratio=compress_ratio,
         ctas_per_group=ctas_per_group,
         num_sms=num_sms,
+        input_col_stride=input_col_stride,
     )
     sym_groups = cute.sym_int()  # number of requests (= num_rows // next_n)
     sym_n = N  # static vocab width
@@ -832,17 +835,32 @@ def _compile_radix(
     max_num_groups = max(1, num_sms // ctas_per_group)
 
     dtype_name = str(cute_dtype).split(".")[-1]
+    if input_row_stride is None:
+        input_row_stride = N * input_col_stride
     kernel_name = (
         f"{dtype_name}_topk{top_k}_nextn{next_n}_cr{compress_ratio}"
         f"_N{N}_rv{int(return_output_values)}_cta{ctas_per_group}_chunk{chunk_size}_sms{num_sms}"
+        f"_is{input_col_stride}_irs{input_row_stride}"
     )
 
     def _compile_fn():
+        if input_col_stride == 1:
+            input_fake = cute.runtime.make_fake_compact_tensor(
+                cute_dtype,
+                (sym_rows, sym_n),
+                stride_order=(1, 0),
+                assumed_align=16,
+            )
+        else:
+            input_fake = cute.runtime.make_fake_tensor(
+                cute_dtype,
+                (sym_rows, sym_n),
+                stride=(input_row_stride, input_col_stride),
+                assumed_align=4,
+            )
         return cute.compile(
             kernel,
-            cute.runtime.make_fake_compact_tensor(
-                cute_dtype, (sym_rows, sym_n), stride_order=(1, 0), assumed_align=16
-            ),
+            input_fake,
             cute.runtime.make_fake_compact_tensor(
                 cutlass.Int32, (max_num_groups, _RADIX_STATE_SIZE), stride_order=(1, 0)
             ),

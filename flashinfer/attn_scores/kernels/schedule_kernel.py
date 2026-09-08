@@ -39,7 +39,7 @@ from cutlass.utils.smem_allocator import SmemAllocator
 class PagedMQALogitsScheduleKernel:
     """Single-warp GPU kernel that computes paged MQA logits CTA schedule.
 
-    Compile-time params: aligned_batch_size (multiple of 32), split_kv, num_sms.
+    Compile-time params: aligned_batch_size (multiple of 32), kv_chunk_size, num_sms.
     Runtime: context_lens [B] int32 (CUDA), schedule_meta [num_sms+1, 2] int32 (CUDA),
     batch_size int32.
 
@@ -47,10 +47,10 @@ class PagedMQALogitsScheduleKernel:
     but entirely on-device with no D2H copy of context_lens.
     """
 
-    def __init__(self, aligned_batch_size: int, split_kv: int, num_sms: int):
+    def __init__(self, aligned_batch_size: int, kv_chunk_size: int, num_sms: int):
         assert aligned_batch_size > 0 and aligned_batch_size % 32 == 0
         self.aligned_batch_size = aligned_batch_size
-        self.split_kv = split_kv
+        self.kv_chunk_size = kv_chunk_size
         self.num_sms = num_sms
 
     @cute.jit
@@ -73,7 +73,7 @@ class PagedMQALogitsScheduleKernel:
         batch_size: cutlass.Int32,
     ):
         kAligned = cutlass.const_expr(self.aligned_batch_size)
-        SPLIT_KV = cutlass.const_expr(self.split_kv)
+        KV_CHUNK_SIZE = cutlass.const_expr(self.kv_chunk_size)
         kNumSMs = cutlass.const_expr(self.num_sms)
         kNumChunks = cutlass.const_expr(kAligned // 32)
         # Halvings needed for the phase-3 partition search to converge.
@@ -90,7 +90,7 @@ class PagedMQALogitsScheduleKernel:
             byte_alignment=128,
         )
 
-        # Phase 1: per-lane register array of ceil_div(ctx, SPLIT_KV).
+        # Phase 1: per-lane register array of ceil_div(ctx, KV_CHUNK_SIZE).
         # Out-of-range lanes contribute 0 (matches CUDA q_idx<batch_size guard).
         num_segs = [cutlass.Int32(0)] * kNumChunks
         for k in cutlass.range_constexpr(kNumChunks):
@@ -98,7 +98,7 @@ class PagedMQALogitsScheduleKernel:
             ctx_len = cutlass.Int32(0)
             if q_idx < batch_size:
                 ctx_len = context_lens[q_idx]
-            num_segs[k] = (ctx_len + (SPLIT_KV - 1)) // SPLIT_KV
+            num_segs[k] = (ctx_len + (KV_CHUNK_SIZE - 1)) // KV_CHUNK_SIZE
 
         # Phase 2: warp-level inclusive scan with carry across chunks → SMEM.
         sum_carry = cutlass.Int32(0)
@@ -190,8 +190,10 @@ def _cached_schedule_source_files() -> Tuple[str, ...]:
 
 
 @functools.cache
-def _compile_schedule_kernel(aligned_b: int, split_kv: int, num_sms: int, arch: str):
-    """Compile GPU schedule kernel; cached by (aligned_b, split_kv, num_sms, arch).
+def _compile_schedule_kernel(
+    aligned_b: int, kv_chunk_size: int, num_sms: int, arch: str
+):
+    """Compile GPU schedule kernel; cached by chunk size, shape, SMs, and arch.
 
     ``arch`` pins codegen to the target device rather than to CUTLASS's
     default probe, which queries ordinal 0 unconditionally.
@@ -212,7 +214,7 @@ def _compile_schedule_kernel(aligned_b: int, split_kv: int, num_sms: int, arch: 
     )
     fake_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
-    kern = PagedMQALogitsScheduleKernel(aligned_b, split_kv, num_sms)
+    kern = PagedMQALogitsScheduleKernel(aligned_b, kv_chunk_size, num_sms)
 
     def _compile_fn():
         return cute.compile(
@@ -226,7 +228,7 @@ def _compile_schedule_kernel(aligned_b: int, split_kv: int, num_sms: int, arch: 
 
     return build_and_load_cute_dsl_kernel(
         "attn_scores_schedule",
-        f"sched_b{aligned_b}_split{split_kv}_sms{num_sms}_{arch}",
+        f"sched_b{aligned_b}_chunk{kv_chunk_size}_sms{num_sms}_{arch}",
         _compile_fn,
         extra_key_files=_cached_schedule_source_files(),
     )
