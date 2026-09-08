@@ -20,6 +20,7 @@ import json
 from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import flashinfer
@@ -168,6 +169,56 @@ def test_all_registered_trace_templates_have_check():
         if template.check is None
     ]
     assert not missing
+
+
+def test_fp8_paged_mqa_topk_bound_trace():
+    """The public wrapper trace resolves plan-owned prefixes and TopK width."""
+    from flashinfer.fi_trace import fi_trace
+
+    wrapper = flashinfer.FP8PagedMQATopKWrapper(strategy="selective")
+    wrapper._prepared = SimpleNamespace()
+    wrapper._cu_q = torch.tensor([0, 4], dtype=torch.int32)
+    wrapper._cu_kv = torch.tensor([0, 64], dtype=torch.int32)
+    wrapper._top_k = 32
+    q = torch.empty(4, 8, 128, dtype=torch.float8_e4m3fn)
+    kv_fused = torch.empty(1, 64, 1, 132, dtype=torch.uint8)
+    weights = torch.empty(4, 8, dtype=torch.float32)
+    block_table = torch.zeros(1, 1, dtype=torch.int32)
+
+    definition = fi_trace(
+        wrapper.run,
+        q=q,
+        kv_fused=kv_fused,
+        weights=weights,
+        block_table=block_table,
+    )
+    _check_defn(
+        definition,
+        "paged_mqa_topk",
+        "FP8PagedMQATopKWrapper.run",
+    )
+    assert definition["axes"]["top_k"]["value"] == 32
+    assert definition["outputs"]["indices"] == {
+        "shape": ["total_q", "top_k"],
+        "dtype": "int32",
+        "description": "Request-local exact causal TopK indices.",
+    }
+    assert definition["inputs"]["cu_q"]["dtype"] == "int32"
+    assert definition["inputs"]["cu_kv"]["dtype"] == "int32"
+
+
+def test_fp8_paged_mqa_topk_trace_requires_plan():
+    from flashinfer.fi_trace import fi_trace
+
+    wrapper = flashinfer.FP8PagedMQATopKWrapper(strategy="selective")
+    with pytest.raises(RuntimeError, match=r"plan\(\) must be called"):
+        fi_trace(
+            wrapper.run,
+            q=torch.empty(1, 8, 128, dtype=torch.float8_e4m3fn),
+            kv_fused=torch.empty(1, 64, 1, 132, dtype=torch.uint8),
+            weights=torch.empty(1, 8, dtype=torch.float32),
+            block_table=torch.zeros(1, 1, dtype=torch.int32),
+        )
 
 
 def test_norm_trace_check_tolerances_match_unit_tests():

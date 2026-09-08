@@ -38,6 +38,7 @@ gemma_rmsnorm_h4608.json
 gelu_and_mul_h16384.json
 gelu_tanh_and_mul_h16384.json
 fp8_paged_mqa_logits_nn2_H64_D128_bs64.json
+fp8_paged_mqa_topk_H8_D128_ps64_k512.json
 fp4_paged_mqa_logits_nn2_H64_Dp64_bs64.json
 gqa_paged_decode_h32_kv8_d128_ps16.json
 gqa_paged_decode_h32_kv8_d128_ps64.json
@@ -2302,3 +2303,24 @@ with contextlib.suppress(Exception):
             _fp4_in["block_table"],
             _fp4_in["max_context_len"],
         )
+
+# Exact selective FP8 paged-MQA score-to-TopK wrapper. The trace includes
+# plan-owned ragged prefixes and TopK width while exposing only public run().
+with contextlib.suppress(Exception):
+    from flashinfer.trace.templates.attn_scores import (
+        fp8_paged_mqa_topk_trace as _fp8_selective_topk_trace,
+    )
+
+    _selective_in = _fp8_selective_topk_trace.init(
+        total_q=16,
+        batch_size=1,
+        num_heads=8,
+        head_dim=128,
+        page_size=64,
+        max_kv_len=8192,
+        top_k=512,
+        device=device,
+    )
+    _selective_topk = flashinfer.FP8PagedMQATopKWrapper(strategy="selective")
+    _selective_topk.plan(**_selective_in["plan"])
+    _selective_topk.run(**_selective_in["run"])

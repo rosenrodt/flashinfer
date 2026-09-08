@@ -40,6 +40,7 @@ _TRACE_REGISTRATION_MODULES = (
     "flashinfer.attention.prims_ts.decode",
     "flashinfer.attention.prims_ts.mla_decode",
     "flashinfer.attn_scores.attn_scores",
+    "flashinfer.attn_scores.selective_logits",
     "flashinfer.cake_vsa",
     "flashinfer.cascade",
     "flashinfer.comm.allreduce",
