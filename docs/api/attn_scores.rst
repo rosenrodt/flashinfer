@@ -47,6 +47,27 @@ Paged MQA Logits
 
 .. autofunction:: fp4_paged_mqa_logits
 
+FP8 MQA TopK
+------------
+
+The TopK wrapper exposes one exact ``plan``/``run`` operation with an explicit,
+lifetime-fixed ``strategy``. ``"full"`` composes paged logits with exact
+variable-length TopK; ``"selective"`` uses bounded candidate publication and
+exact repair. The selective sampling, candidate, repair, radix, and
+finalization phases remain private implementation details that are independently
+testable and profileable. Packed ragged batches and every integer TopK from 1
+through 512 are supported; rows shorter than K retain all causal keys and use
+request-local key zero for fixed-width padding. Query and KV sequence lengths
+remain runtime metadata rather than CuTe compile-cache keys.
+
+.. autosummary::
+  :toctree: ../generated
+
+  FP8PagedMQATopKWrapper
+
+.. autoclass:: FP8PagedMQATopKWrapper
+  :members:
+
 Scheduling and Setup
 --------------------
 

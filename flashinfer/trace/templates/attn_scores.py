@@ -350,6 +350,335 @@ fp8_paged_mqa_logits_trace = TraceTemplate(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Selective FP8 paged MQA TopK wrapper
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _selective_topk_row_scores(q, kv_fused, weights, cu_q, cu_kv, block_table):
+    """Return request-local causal score rows for the selective TopK reference."""
+    num_blocks, block_size, _one, row_bytes = kv_fused.shape
+    head_dim = row_bytes - 4
+    flat = kv_fused.reshape(num_blocks, -1)
+    kv_fp8 = (
+        flat[:, : block_size * head_dim]
+        .reshape(num_blocks, block_size, head_dim)
+        .view(torch.float8_e4m3fn)
+    )
+    scales = (
+        flat[:, block_size * head_dim :]
+        .contiguous()
+        .view(torch.float32)
+        .reshape(num_blocks, block_size)
+    )
+
+    rows = []
+    q_prefix = cu_q.tolist()
+    kv_prefix = cu_kv.tolist()
+    for request in range(len(q_prefix) - 1):
+        q_begin, q_end = q_prefix[request : request + 2]
+        kv_begin, kv_end = kv_prefix[request : request + 2]
+        q_len = q_end - q_begin
+        kv_len = kv_end - kv_begin
+        page_count = (kv_len + block_size - 1) // block_size
+        page_ids = block_table[request, :page_count].long()
+        request_kv = kv_fp8[page_ids].reshape(-1, head_dim)[:kv_len].float()
+        request_scales = scales[page_ids].reshape(-1)[:kv_len]
+        for local_q, row in enumerate(range(q_begin, q_end)):
+            row_end = kv_len - q_len + local_q + 1
+            per_head = torch.matmul(q[row].float(), request_kv[:row_end].T)
+            score = (torch.relu(per_head) * weights[row].float().unsqueeze(1)).sum(
+                dim=0
+            )
+            rows.append(score * request_scales[:row_end])
+    return rows
+
+
+@torch.no_grad()
+def _fp8_paged_mqa_selective_topk_reference(
+    q,
+    kv_fused,
+    weights,
+    block_table,
+    cu_q=None,
+    cu_kv=None,
+    top_k=512,
+    **_unused,
+):
+    """Compute exact request-local causal TopK indices with a PyTorch oracle."""
+    if cu_q is None or cu_kv is None:
+        raise ValueError("selective TopK reference requires plan-owned cu_q and cu_kv")
+    score_rows = _selective_topk_row_scores(
+        q, kv_fused, weights, cu_q, cu_kv, block_table
+    )
+    selected = torch.zeros((q.shape[0], top_k), dtype=torch.int32, device=q.device)
+    for row, scores in enumerate(score_rows):
+        count = min(top_k, scores.numel())
+        selected[row, :count] = torch.topk(
+            scores, count, largest=True, sorted=False
+        ).indices.to(torch.int32)
+    return selected
+
+
+def _fp8_paged_mqa_selective_topk_check(
+    reference_outputs,
+    actual_outputs,
+    *,
+    q=None,
+    kv_fused=None,
+    weights=None,
+    block_table=None,
+    cu_q=None,
+    cu_kv=None,
+    top_k=512,
+    rtol=2e-2,
+    atol=2e-2,
+    **_unused,
+):
+    """Validate bounds, uniqueness, padding, and tie-aware TopK membership."""
+    actual = actual_outputs[0] if isinstance(actual_outputs, list) else actual_outputs
+    reference = (
+        reference_outputs[0]
+        if isinstance(reference_outputs, list)
+        else reference_outputs
+    )
+    if actual.shape != reference.shape:
+        return False
+    if any(value is None for value in (q, kv_fused, weights, block_table, cu_q, cu_kv)):
+        return torch.equal(actual, reference)
+
+    score_rows = _selective_topk_row_scores(
+        q, kv_fused, weights, cu_q, cu_kv, block_table
+    )
+    for row, scores in enumerate(score_rows):
+        valid_count = min(top_k, scores.numel())
+        indices = actual[row, :valid_count].long()
+        if (indices < 0).any() or (indices >= scores.numel()).any():
+            return False
+        if torch.unique(indices).numel() != valid_count:
+            return False
+        if scores.numel() < top_k:
+            if not torch.equal(
+                torch.sort(indices).values,
+                torch.arange(scores.numel(), device=indices.device),
+            ):
+                return False
+            if not torch.count_nonzero(actual[row, valid_count:]).eq(0):
+                return False
+            continue
+        kth = torch.topk(scores, top_k).values[-1]
+        tolerance = atol + rtol * kth.abs()
+        if (scores[indices] < kth - tolerance).any():
+            return False
+    return True
+
+
+def _fp8_paged_mqa_selective_topk_init(
+    *,
+    total_q: int = 16,
+    batch_size: int = 1,
+    num_heads: int = 8,
+    head_dim: int = 128,
+    page_size: int = 64,
+    max_kv_len: int = 8192,
+    top_k: int = 512,
+    num_pages: int = 0,
+    max_pages_per_request: int = 0,
+    batch_plus_one: int = 0,
+    num_kv_heads: int = 1,
+    block_row_bytes: int = 0,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build a planned selective FP8 score-to-TopK wrapper invocation."""
+    del num_pages, max_pages_per_request, batch_plus_one, block_row_bytes
+    if num_kv_heads != 1:
+        raise ValueError("selective FP8 MQA trace requires num_kv_heads=1")
+    if total_q < batch_size or max_kv_len < (total_q + batch_size - 1) // batch_size:
+        raise ValueError("trace shape requires at least one causal KV row per query")
+
+    torch.manual_seed(seed)
+    base = total_q // batch_size
+    remainder = total_q % batch_size
+    q_lengths = [base + (request < remainder) for request in range(batch_size)]
+    q_prefix = [0]
+    for length in q_lengths:
+        q_prefix.append(q_prefix[-1] + length)
+    cu_q = torch.tensor(q_prefix, dtype=torch.int32, device=device)
+    cu_kv = torch.arange(batch_size + 1, dtype=torch.int32, device=device) * max_kv_len
+    context_lens = torch.full(
+        (batch_size,), max_kv_len, dtype=torch.int32, device=device
+    )
+    block_table, physical_pages = _make_paged_block_table(
+        context_lens, page_size, device
+    )
+    q = (torch.randn(total_q, num_heads, head_dim, device=device) * 0.1).to(
+        torch.float8_e4m3fn
+    )
+    kv = (torch.randn(physical_pages, page_size, head_dim, device=device) * 0.1).to(
+        torch.float8_e4m3fn
+    )
+    scales = torch.rand(
+        physical_pages, page_size, dtype=torch.float32, device=device
+    ).add_(0.5)
+    kv_fused = _pack_fused_kv_fp8(kv, scales, page_size, head_dim)
+    weights = torch.randn(total_q, num_heads, dtype=torch.float32, device=device)
+    return {
+        "plan": {
+            "q": q,
+            "kv_fused": kv_fused,
+            "weights": weights,
+            "cu_q": cu_q,
+            "cu_kv": cu_kv,
+            "block_table": block_table,
+            "top_k": top_k,
+            "num_heads": num_heads,
+            "head_dim": head_dim,
+        },
+        "run": {
+            "q": q,
+            "kv_fused": kv_fused,
+            "weights": weights,
+            "block_table": block_table,
+        },
+    }
+
+
+_fp8_paged_mqa_selective_topk_reference._trace_reference_dependencies = (
+    _selective_topk_row_scores,
+)
+_fp8_paged_mqa_selective_topk_init._trace_init_dependencies = (  # type: ignore[attr-defined]
+    _make_paged_block_table,
+    _pack_fused_kv_fp8,
+)
+
+
+class _SelectiveTopKTraceTemplate(TraceTemplate):
+    """Inject plan-owned metadata when tracing a live selective wrapper."""
+
+    def build_fi_trace_fn(self, fi_api):
+        base_fi_trace = super().build_fi_trace_fn(fi_api)
+
+        def fi_trace(save_dir=None, name=None, **kwargs):
+            wrapper = kwargs.get("self")
+            if wrapper is not None:
+                kwargs.setdefault("cu_q", getattr(wrapper, "_cu_q", None))
+                kwargs.setdefault("cu_kv", getattr(wrapper, "_cu_kv", None))
+                kwargs.setdefault("top_k", getattr(wrapper, "_top_k", 512))
+            else:
+                # Stable trace consistency tests construct the template without
+                # a live wrapper; the public dispatcher still requires one.
+                kwargs.setdefault("top_k", 512)
+            return base_fi_trace(save_dir=save_dir, name=name, **kwargs)
+
+        return fi_trace
+
+
+fp8_paged_mqa_topk_trace = _SelectiveTopKTraceTemplate(
+    op_type="paged_mqa_topk",
+    name_prefix="fp8_paged_mqa_topk",
+    description=(
+        "Exact causal TopK over FP8 paged MQA scores using the caller-selected "
+        "full or selective strategy."
+    ),
+    axes={
+        "total_q": Var(description="Total query rows across the ragged batch."),
+        "batch_size": Var(description="Number of requests."),
+        "batch_plus_one": Var(description="Length of each ragged prefix tensor."),
+        "num_heads": Const(abbrev="H", description="Scoring heads."),
+        "head_dim": Const(abbrev="D", description="Head dimension."),
+        "num_pages": Var(description="Physical paged-KV pool size."),
+        "page_size": Const(abbrev="ps", description="Tokens per physical KV page."),
+        "num_kv_heads": Const(abbrev="", description="KV heads (MQA => 1)."),
+        "block_row_bytes": Const(
+            abbrev="", description="Fused KV row bytes (head_dim + 4)."
+        ),
+        "max_pages_per_request": Var(description="Padded page-table width."),
+        "max_kv_len": Var(description="Maximum logical KV length."),
+        "top_k": Const(abbrev="k", description="Selected indices per query row."),
+    },
+    inputs={
+        "q": Tensor(
+            ["total_q", "num_heads", "head_dim"],
+            dtype="float8_e4m3fn",
+            description="Contiguous FP8 E4M3 queries.",
+        ),
+        "kv_fused": Tensor(
+            ["num_pages", "page_size", "num_kv_heads", "block_row_bytes"],
+            dtype="uint8",
+            description="Fused paged FP8 KV and per-token FP32 scales.",
+        ),
+        "weights": Tensor(
+            ["total_q", "num_heads"],
+            dtype="float32",
+            description="Per-query head weights.",
+        ),
+        "block_table": Tensor(
+            ["batch_size", "max_pages_per_request"],
+            dtype="int32",
+            description="Logical-to-physical KV page mapping.",
+        ),
+        "cu_q": Tensor(
+            ["batch_plus_one"],
+            dtype="int32",
+            optional=True,
+            description="Plan-owned ragged query prefix sums.",
+        ),
+        "cu_kv": Tensor(
+            ["batch_plus_one"],
+            dtype="int32",
+            optional=True,
+            description="Plan-owned ragged KV prefix sums.",
+        ),
+        "top_k": Scalar("int32", optional=True, description="Plan-owned TopK width."),
+        "max_kv_len": Scalar(
+            "int32", optional=True, description="Largest plan-owned KV length."
+        ),
+    },
+    outputs={
+        "indices": Tensor(
+            ["total_q", "top_k"],
+            dtype="int32",
+            description="Request-local exact causal TopK indices.",
+        )
+    },
+    constraints=[
+        "num_kv_heads == 1",
+        "block_row_bytes == head_dim + 4",
+        "batch_plus_one == batch_size + 1",
+        "top_k >= 1",
+        "top_k <= 512",
+    ],
+    tags=["status:verified", "arch:sm100", "stage:score-to-topk"],
+    reference=_fp8_paged_mqa_selective_topk_reference,
+    check=_fp8_paged_mqa_selective_topk_check,
+    init=_fp8_paged_mqa_selective_topk_init,
+)
+
+
+def fp8_paged_mqa_topk_trace_dispatch(**kwargs):
+    """Require a planned live wrapper for plan-owned trace metadata."""
+    wrapper = kwargs.get("self")
+    if wrapper is None:
+        raise ValueError(
+            "Tracing FP8PagedMQATopKWrapper.run requires the live "
+            "wrapper's plan state. Use flashinfer.fi_trace(wrapper.run, ...)."
+        )
+    planned = (
+        getattr(wrapper, "_prepared", None) is not None
+        if getattr(wrapper, "strategy", None) == "selective"
+        else getattr(wrapper, "_full_graph_identity", None) is not None
+    )
+    if not planned:
+        raise RuntimeError("plan() must be called before tracing run()")
+    return fp8_paged_mqa_topk_trace
+
+
+fp8_paged_mqa_topk_trace_dispatch.templates = [  # type: ignore[attr-defined]
+    fp8_paged_mqa_topk_trace
+]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # FP4 (MXFP4) helpers
 # ──────────────────────────────────────────────────────────────────────────────
 

@@ -19,6 +19,7 @@ from .attn_scores import (
     padded_context_len,
     precompile_paged_mqa_logits,
 )
+from .selective_logits import FP8PagedMQATopKWrapper
 
 __all__ = [
     "fp8_paged_mqa_logits",
@@ -26,4 +27,5 @@ __all__ = [
     "compute_paged_mqa_logits_schedule",
     "padded_context_len",
     "precompile_paged_mqa_logits",
+    "FP8PagedMQATopKWrapper",
 ]
