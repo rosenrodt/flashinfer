@@ -213,6 +213,7 @@ def _vsa_common_checks(
     pos_encoding_mode: str,
     logits_soft_cap,
     supports_causal: bool = False,
+    supports_asymmetric_causal: bool = False,
 ) -> None:
     """Validate the arguments that are identical across all VSA backends."""
     if num_qo_heads % num_kv_heads != 0:
@@ -231,10 +232,14 @@ def _vsa_common_checks(
         )
     if causal and not supports_causal:
         raise ValueError(f"{backend} backend does not support causal masking.")
-    if causal and M != N:
+    if causal and M != N and not supports_asymmetric_causal:
         raise ValueError(
             f"{backend} causal masking requires aligned self-attention with M == N "
             f"(got M={M}, N={N})."
+        )
+    if causal and supports_asymmetric_causal and N < M:
+        raise ValueError(
+            f"{backend} bottom-right causal masking requires N >= M (got M={M}, N={N})."
         )
     if pos_encoding_mode != "NONE":
         raise ValueError(
@@ -585,8 +590,8 @@ class BlockSparseAttentionWrapper:
             Whether to apply causal mask to the attention matrix.
             This is only effective when :attr:`custom_mask` is not provided in
             :meth:`plan`.
-            The ``vsa_sm100_blk128`` backend supports causal masking for aligned
-            self-attention where ``M == N``.
+            The ``vsa_sm100_blk128`` backend supports bottom-right causal
+            masking where ``N >= M``; queries are positioned at ``N - M``.
         pos_encoding_mode : str, optional
             The position encoding applied inside attention kernels, could be
             ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
@@ -885,6 +890,7 @@ class BlockSparseAttentionWrapper:
                 pos_encoding_mode,
                 logits_soft_cap,
                 supports_causal=True,
+                supports_asymmetric_causal=True,
             )
 
             MB = M // R

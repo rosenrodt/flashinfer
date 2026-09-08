@@ -149,8 +149,10 @@ def _pytorch_ref(
     vf = v.repeat_interleave(group_size, dim=1).float().permute(1, 0, 2)
     scores = torch.matmul(qf, kf.transpose(-1, -2)) * sm_scale  # [H, M, N]
     if causal:
-        mask &= torch.arange(N, device=q.device).unsqueeze(0) <= torch.arange(
-            M, device=q.device
+        # Match prefill/decode bottom-right alignment: query i has absolute
+        # position N - M + i in the KV sequence.
+        mask &= torch.arange(N, device=q.device).unsqueeze(0) <= (
+            torch.arange(M, device=q.device) + N - M
         ).unsqueeze(1)
     scores = scores.masked_fill(~mask.unsqueeze(0), float("-inf"))
     probs = torch.softmax(scores, dim=-1)
@@ -301,18 +303,53 @@ def test_vsa_causal_gqa_accuracy(workspace):
     torch.testing.assert_close(o_ref, o, atol=1e-2, rtol=1e-2)
 
 
-def test_vsa_causal_rejects_asymmetric_sequences(workspace):
-    """Causal blk128 rejects layouts whose query origin is not KV origin."""
+def test_vsa_causal_gqa_asymmetric_sequences(workspace):
+    """Causal blk128 uses bottom-right query positions when M < N."""
     device = torch.device("cuda")
-    indptr = torch.tensor([0, 1], dtype=torch.int32, device=device)
-    indices = torch.tensor([0], dtype=torch.int32, device=device)
+    torch.manual_seed(2027)
+    M, N = 4 * R, 8 * C
+    q = torch.randn(M, 8, HEAD_DIM, dtype=torch.bfloat16, device=device)
+    k = torch.randn(N, 1, HEAD_DIM, dtype=torch.bfloat16, device=device)
+    v = torch.randn_like(k)
+    # Each local query row includes a prefix page, its bottom-right diagonal
+    # page, and a future page that causal masking must discard.
+    indptr = torch.tensor([0, 3, 6, 9, 12], dtype=torch.int32, device=device)
+    indices = torch.tensor(
+        [0, 4, 5, 0, 5, 6, 0, 6, 7, 0, 3, 7],
+        dtype=torch.int32,
+        device=device,
+    )
+    o_ref = _pytorch_ref(q, k, v, indptr, indices, R, C, causal=True)
     wrapper = _make_wrapper(workspace)
-    with pytest.raises(ValueError, match="aligned self-attention"):
+    wrapper.plan(
+        indptr,
+        indices,
+        M,
+        N,
+        R,
+        C,
+        8,
+        1,
+        HEAD_DIM,
+        q_data_type=torch.bfloat16,
+        causal=True,
+    )
+    o = wrapper.run(q, k, v)
+    torch.testing.assert_close(o_ref, o, atol=1e-2, rtol=1e-2)
+
+
+def test_vsa_causal_rejects_query_longer_than_kv(workspace):
+    """Bottom-right causal alignment is undefined when M exceeds N."""
+    device = torch.device("cuda")
+    indptr = torch.tensor([0, 1, 2], dtype=torch.int32, device=device)
+    indices = torch.tensor([0, 0], dtype=torch.int32, device=device)
+    wrapper = _make_wrapper(workspace)
+    with pytest.raises(ValueError, match="requires N >= M"):
         wrapper.plan(
             indptr,
             indices,
-            R,
-            2 * C,
+            2 * R,
+            C,
             R,
             C,
             8,

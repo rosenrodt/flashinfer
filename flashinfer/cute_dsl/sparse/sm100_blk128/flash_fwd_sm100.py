@@ -918,6 +918,11 @@ class FlashAttentionForwardSm100:
             else mQ.shape[0][1],
             seqlen_k_static=mK.shape[0],
         )
+        q_seqlen = mQ.shape[0] if const_expr(not self.pack_gqa) else mQ.shape[0][1]
+        # Bottom-right causal alignment: local query token 0 has absolute
+        # position seqlen_k - seqlen_q. The public frontend requires this
+        # offset to be block-128 aligned, so only a block offset is needed.
+        q_block_offset = Int32((mK.shape[0] - q_seqlen) // self.n_block_size)
         # Create tile scheduler (and CLC pipeline if enabled)
         if const_expr(self.use_clc_scheduler):
             clc_response_ptr = storage.clc_response.data_ptr()
@@ -1094,6 +1099,7 @@ class FlashAttentionForwardSm100:
                 mBlockSizes=mBlockSizes,
                 block_sparse_num=block_sparse_num,
                 mBlockNums=mBlockNums,
+                q_block_offset=q_block_offset,
             )
 
             if const_expr(not self.s0_s1_barrier):
@@ -1685,6 +1691,7 @@ class FlashAttentionForwardSm100:
         mBlockSizes: cute.Tensor,
         block_sparse_num: Int32,
         mBlockNums: Optional[cute.Tensor],
+        q_block_offset: Int32,
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
 
@@ -1803,8 +1810,9 @@ class FlashAttentionForwardSm100:
             # PackGQA flattens query tokens and their GQA heads into M tiles.
             # Recover the original token limit so the diagonal KV page can be
             # masked without discarding Q/KV reuse across the packed tile.
-            q_block = m_block // self.qhead_per_kvhead
-            q_subblock = m_block - q_block * self.qhead_per_kvhead
+            local_q_block = m_block // self.qhead_per_kvhead
+            q_block = local_q_block + q_block_offset
+            q_subblock = m_block - local_q_block * self.qhead_per_kvhead
             q_limit = (
                 q_subblock * (self.m_block_size // self.qhead_per_kvhead)
                 + tidx // self.qhead_per_kvhead
