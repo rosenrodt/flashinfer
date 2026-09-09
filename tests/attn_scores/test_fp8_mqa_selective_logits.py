@@ -3102,3 +3102,76 @@ def test_segmented_candidate_finalizer_compacts_in_place(num_segments):
             rows=1,
             capacity=capacity - 1,
         )
+
+
+@pytest.mark.parametrize("q_rows", [1, 33])
+@pytest.mark.parametrize("strategy", ["full", "selective"])
+def test_wrapper_page_map_updates_in_eager_and_graph(strategy, q_rows):
+    """Both execution modes consume the current physical mapping."""
+    from flashinfer import FP8PagedMQATopKWrapper
+
+    q, kv, scale, weights, _, _ = _inputs(q_rows=q_rows, kv_rows=8192)
+    cu_q = torch.tensor([0, q_rows], device="cuda", dtype=torch.int32)
+    cu_kv = torch.tensor([0, kv.shape[0]], device="cuda", dtype=torch.int32)
+    fused = _fuse_paged_kv(kv, scale)
+    table = torch.arange(fused.shape[0], device="cuda", dtype=torch.int32)[None, :]
+    wrapper = FP8PagedMQATopKWrapper(strategy=strategy)
+    wrapper.plan(q, fused, weights, cu_q, cu_kv, table, top_k=8)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = wrapper.run(q, fused, weights, table)
+    for shift in (1, 3):
+        order = torch.arange(fused.shape[0], device="cuda").roll(shift)
+        table.copy_(order[None, :])
+        mapped_kv = kv.reshape(-1, 128, 128)[order].reshape_as(kv)
+        mapped_scale = scale.reshape(-1, 128)[order].reshape_as(scale)
+        oracle = _oracle_rows((q, mapped_kv, mapped_scale, weights, cu_q, cu_kv))
+        eager = wrapper.run(q, fused, weights, table).clone()
+        graph.replay()
+        torch.cuda.synchronize()
+        for actual in (eager, output):
+            for row, scores in enumerate(oracle):
+                indices = actual[row].long()
+                assert ((indices >= 0) & (indices < scores.numel())).all()
+                assert indices.unique().numel() == 8
+                torch.testing.assert_close(
+                    scores[indices].sort().values,
+                    scores.topk(8).values.sort().values,
+                    atol=5e-5,
+                    rtol=1e-5,
+                )
+
+
+@pytest.mark.parametrize("q_rows", [1, 33])
+def test_full_wrapper_failed_capture_rejects_run_and_retries(monkeypatch, q_rows):
+    from flashinfer import FP8PagedMQATopKWrapper
+
+    q, kv, scale, weights, _, _ = _inputs(q_rows=q_rows, kv_rows=256)
+    cu_q = torch.tensor([0, q_rows], device="cuda", dtype=torch.int32)
+    cu_kv = torch.tensor([0, kv.shape[0]], device="cuda", dtype=torch.int32)
+    fused = _fuse_paged_kv(kv, scale)
+    table = torch.arange(fused.shape[0], device="cuda", dtype=torch.int32)[None, :]
+    wrapper = FP8PagedMQATopKWrapper(strategy="full")
+    wrapper.plan(q, fused, weights, cu_q, cu_kv, table, top_k=8)
+
+    def fail_capture():
+        raise RuntimeError("injected capture failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.cuda, "CUDAGraph", fail_capture)
+        with pytest.raises(RuntimeError, match="injected capture failure"):
+            wrapper.plan(q, fused, weights, cu_q, cu_kv, table, top_k=4)
+    with pytest.raises(RuntimeError, match="plan must be called"):
+        wrapper.run(q, fused, weights, table)
+
+    wrapper.plan(q, fused, weights, cu_q, cu_kv, table, top_k=4)
+    output = wrapper.run(q, fused, weights, table)
+    torch.cuda.synchronize()
+    assert output.shape == (q_rows, 4)
+    for row, scores in enumerate(_oracle_rows((q, kv, scale, weights, cu_q, cu_kv))):
+        torch.testing.assert_close(
+            scores[output[row].long()].sort().values,
+            scores.topk(4).values.sort().values,
+            atol=5e-5,
+            rtol=1e-5,
+        )

@@ -3581,8 +3581,6 @@ class _FP8PagedMQASelectiveTopKEngine:
         :meth:`plan`. During an enclosing CUDA-graph capture, the individual
         operations are emitted directly so the wrapper remains composable.
         """
-        if torch.cuda.is_current_stream_capturing():
-            return self._run_impl(q, kv_fused, weights, block_table)
         if self._cuda_graph is None or self._graph_identity is None:
             raise RuntimeError("plan must be called before run")
         identity = _selective_logits_launch_identity(
@@ -3590,6 +3588,8 @@ class _FP8PagedMQASelectiveTopKEngine:
         )
         if identity != self._graph_identity:
             raise ValueError("run tensors must match the address-stable plan")
+        if torch.cuda.is_current_stream_capturing():
+            return self._run_impl(q, kv_fused, weights, block_table)
         self._cuda_graph.replay()
         assert self._selected is not None
         return self._selected
@@ -3613,7 +3613,7 @@ class FP8PagedMQATopKWrapper(_FP8PagedMQASelectiveTopKEngine):
         super().__init__()
         self._strategy = strategy
         self._full_groups: list[
-            tuple[int, int, int, torch.Tensor, torch.Tensor, torch.Tensor]
+            tuple[int, int, int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
         ] = []
         self._full_scores: torch.Tensor | None = None
         self._full_row_ends: torch.Tensor | None = None
@@ -3714,6 +3714,11 @@ class FP8PagedMQATopKWrapper(_FP8PagedMQASelectiveTopKEngine):
                 chunks.append((chunk_begin, chunk_end, request, context_end))
                 chunk_begin = chunk_end
 
+        # Invalidate before replacing any storage; a failed rebuild must not
+        # replay a graph bound to the previous generation's output buffers.
+        self._full_graph_identity = None
+        self._full_cuda_graph = None
+        self._full_impl = None
         self._rows = q.shape[0]
         self._batches = len(q_prefix) - 1
         self._top_k = top_k
@@ -3769,7 +3774,15 @@ class FP8PagedMQATopKWrapper(_FP8PagedMQASelectiveTopKEngine):
             group_block_table = block_table.index_select(0, request_ids).contiguous()
             schedule = compute_paged_mqa_logits_schedule(context_lens, device=q.device)
             self._full_groups.append(
-                (q_begin, q_end, next_n, context_lens, group_block_table, schedule)
+                (
+                    q_begin,
+                    q_end,
+                    next_n,
+                    context_lens,
+                    group_block_table,
+                    schedule,
+                    request_ids,
+                )
             )
             group_begin = group_end
 
@@ -3791,7 +3804,10 @@ class FP8PagedMQATopKWrapper(_FP8PagedMQASelectiveTopKEngine):
                 context_lens,
                 group_block_table,
                 schedule,
+                request_ids,
             ) in full_groups:
+                # Page mappings are per-run payload, including graph replay.
+                torch.index_select(block_table, 0, request_ids, out=group_block_table)
                 batch = (q_end - q_begin) // next_n
                 fp8_paged_mqa_logits(
                     q[q_begin:q_end].view(batch, next_n, num_heads, head_dim),
@@ -3817,8 +3833,7 @@ class FP8PagedMQATopKWrapper(_FP8PagedMQASelectiveTopKEngine):
             selected.masked_fill_(selected >= full_row_ends[:, None], 0)
             return selected
 
-        self._full_impl = full_impl
-        self._full_graph_identity = _selective_logits_launch_identity(
+        new_identity = _selective_logits_launch_identity(
             (q, kv_fused, weights, block_table), 0
         )
         full_impl()
@@ -3826,7 +3841,9 @@ class FP8PagedMQATopKWrapper(_FP8PagedMQASelectiveTopKEngine):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             full_impl()
+        self._full_impl = full_impl
         self._full_cuda_graph = graph
+        self._full_graph_identity = new_identity
 
     def plan(
         self,
@@ -3842,7 +3859,38 @@ class FP8PagedMQATopKWrapper(_FP8PagedMQASelectiveTopKEngine):
         head_dim: int = 128,
         num_sms: int | None = None,
     ) -> None:
-        """Prepare the explicitly selected full or selective strategy."""
+        """Prepare exact causal TopK on Blackwell SM100/SM103 outside graph capture.
+
+        Args:
+            q: Contiguous CUDA FP8 E4M3 queries ``[total_q, num_heads, head_dim]``.
+            kv_fused: Contiguous CUDA uint8 storage
+                ``[num_pages, page_size, 1, head_dim + 4]``. Each physical page
+                contains all FP8 keys followed by one FP32 scale per token;
+                the bytes are not interleaved per token. Page size is 32, 64,
+                or 128, with sufficient table padding for 128-token tiles.
+            weights: Contiguous CUDA FP32 weights ``[total_q, num_heads]``.
+            cu_q: Contiguous CUDA int32 query prefix sums ``[batch + 1]``.
+            cu_kv: Contiguous CUDA int32 KV prefix sums ``[batch + 1]``.
+                Prefixes start at zero and are nondecreasing; each request
+                must have at least as many KV tokens as query rows.
+            block_table: Contiguous CUDA int32 physical page indices
+                ``[batch, max_pages]``, with valid entries for padded tiles.
+            top_k: Integer output width from 1 through 512, default 512.
+            num_heads: Scoring head count, default 8; must admit a legal
+                paged-logits compute tile for the selected strategy.
+            head_dim: Head dimension, a positive multiple of 32, default 128;
+                the selected tile must fit device shared memory.
+            num_sms: Selective-only persistent CTA count, from 1 through the
+                device SM count. None uses the device count. Full rejects it.
+
+        All tensors must share one device. Planning reads prefixes on the host
+        and allocates/precompiles run resources. Full replans replace storage;
+        selective replans reuse storage when geometry and topology permit.
+        Replan after changing prefixes, tensor storage/layout, or specialization,
+        and recapture any enclosing graph after replanning. A failed rebuild
+        invalidates run until a successful plan; early validation failures can
+        leave the prior plan usable. Synchronize prior work before replanning.
+        """
         if self._strategy == "selective":
             super().plan(
                 q,
@@ -3878,7 +3926,25 @@ class FP8PagedMQATopKWrapper(_FP8PagedMQASelectiveTopKEngine):
         weights: torch.Tensor,
         block_table: torch.Tensor,
     ) -> torch.Tensor:
-        """Run the planned strategy and return stable exact TopK indices."""
+        """Return plan-owned int32 request-local indices ``[total_q, top_k]``.
+
+        Args:
+            q: Query tensor with the storage, shape and layout passed to plan.
+            kv_fused: Fused KV tensor with the storage and layout passed to plan.
+            weights: FP32 weights with the storage and layout passed to plan.
+            block_table: Page map with the storage and layout passed to plan.
+
+        Input contents, including page mappings, may change in place between
+        calls. Prefix changes require replanning. Output is overwritten on the
+        next run; clone it to retain a result. Ordering is unspecified, ties may
+        select equivalent keys, and underfilled rows retain all causal keys
+        with remaining slots filled by request-local key zero.
+
+        A successful plan is required. Eager calls replay the prepared graph;
+        outer CUDA graph capture emits the operations into that graph. Calls
+        on one wrapper must not overlap; synchronize before switching streams
+        or replanning. Input storage/layout changes raise ValueError.
+        """
         if self._strategy == "selective":
             return self._run_selective(q, kv_fused, weights, block_table)
         if self._full_graph_identity is None or self._full_cuda_graph is None:

@@ -18,6 +18,8 @@ import torch
 ROWS = [4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576]
 EXECUTION_SOURCE_PATHS = (
     "benchmarks/bench_fp8_mqa_selective_logits.py",
+    "flashinfer/attn_scores/attn_scores.py",
+    "flashinfer/attn_scores/kernels/schedule_kernel.py",
     "flashinfer/attn_scores/kernels/fp8_paged_mqa_logits.py",
     "flashinfer/attn_scores/kernels/selective_logits_metadata.py",
     "flashinfer/attn_scores/selective_logits.py",
@@ -325,8 +327,8 @@ def main() -> None:
     parser.add_argument("--page-size", type=int, choices=(32, 64, 128), default=128)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    if args.q <= 0 or args.q % 256:
-        raise ValueError("q must be a positive multiple of 256")
+    if args.q <= 0:
+        raise ValueError("q must be positive")
     if args.repeats <= 0 or args.repeats % 2:
         raise ValueError("repeats must be a positive even number for ABBA measurement")
     if args.num_heads <= 0 or args.head_dim <= 0:
