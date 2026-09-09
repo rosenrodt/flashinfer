@@ -794,8 +794,8 @@ def test_unified_wrapper_matches_ordinary_logits_topk():
         )
 
 
-@pytest.mark.parametrize("top_k", [8, 32, 128, 512])
-def test_unified_wrapper_full_strategy_ragged_causal_topk(top_k):
+@pytest.mark.parametrize("top_k", [1, 8, 17, 32, 128, 511, 512])
+def test_unified_wrapper_full_strategy_ragged_causal_topk(top_k, monkeypatch):
     """Full and selective strategies share the exact public result contract."""
     from flashinfer import FP8PagedMQATopKWrapper
 
@@ -805,6 +805,15 @@ def test_unified_wrapper_full_strategy_ragged_causal_topk(top_k):
     inputs = (q, kv, scale, weights, cu_q, cu_kv)
     kv_fused, block_table = _paged_inputs(inputs)
     oracle = _oracle_rows(inputs)
+
+    torch_topk = torch.topk
+
+    def reject_dense_topk(*args, **kwargs):
+        raise AssertionError(
+            "full strategy must use the native variable-length selector"
+        )
+
+    monkeypatch.setattr(torch, "topk", reject_dense_topk)
 
     wrapper = FP8PagedMQATopKWrapper(strategy="full")
     wrapper.plan(
@@ -819,12 +828,20 @@ def test_unified_wrapper_full_strategy_ragged_causal_topk(top_k):
         head_dim=q.shape[2],
     )
     first = wrapper.run(q, kv_fused, weights, block_table)
+    # Unwritten causal tails are not part of the selector's input domain.
+    # Poison them to catch accidental dense selection after future refactors.
+    invalid = (
+        torch.arange(wrapper._full_scores.shape[1], device=q.device)[None, :]
+        >= wrapper._full_row_ends[:, None]
+    )
+    wrapper._full_scores.masked_fill_(invalid, float("inf"))
     second = wrapper.run(q, kv_fused, weights, block_table)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = wrapper.run(q, kv_fused, weights, block_table)
     graph.replay()
     torch.cuda.synchronize()
+    monkeypatch.setattr(torch, "topk", torch_topk)
 
     assert first.data_ptr() == second.data_ptr()
     assert first.data_ptr() == captured.data_ptr()

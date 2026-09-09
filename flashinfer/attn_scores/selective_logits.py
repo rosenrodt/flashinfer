@@ -3617,9 +3617,6 @@ class FP8PagedMQATopKWrapper(_FP8PagedMQASelectiveTopKEngine):
         ] = []
         self._full_scores: torch.Tensor | None = None
         self._full_row_ends: torch.Tensor | None = None
-        self._full_invalid_mask: torch.Tensor | None = None
-        self._full_topk_scores: torch.Tensor | None = None
-        self._full_topk_indices: torch.Tensor | None = None
         self._full_cuda_graph: torch.cuda.CUDAGraph | None = None
         self._full_graph_identity: tuple[Any, ...] | None = None
         self._full_max_context_len = 0
@@ -3645,6 +3642,7 @@ class FP8PagedMQATopKWrapper(_FP8PagedMQASelectiveTopKEngine):
         num_sms: int | None,
     ) -> None:
         """Prepare full paged logits and exact per-row TopK."""
+        from ..topk_varlen.topk_varlen import top_k_varlen
         from .attn_scores import (
             compute_paged_mqa_logits_schedule,
             fp8_paged_mqa_logits,
@@ -3733,16 +3731,6 @@ class FP8PagedMQATopKWrapper(_FP8PagedMQASelectiveTopKEngine):
             dtype=torch.float32,
             device=q.device,
         )
-        self._full_invalid_mask = (
-            torch.arange(score_columns, dtype=torch.int32, device=q.device)[None, :]
-            >= self._full_row_ends[:, None]
-        )
-        self._full_topk_scores = torch.empty(
-            (self._rows, top_k), dtype=torch.float32, device=q.device
-        )
-        self._full_topk_indices = torch.empty(
-            (self._rows, top_k), dtype=torch.int64, device=q.device
-        )
         self._selected = torch.empty(
             (self._rows, top_k), dtype=torch.int32, device=q.device
         )
@@ -3788,9 +3776,6 @@ class FP8PagedMQATopKWrapper(_FP8PagedMQASelectiveTopKEngine):
 
         full_scores = self._full_scores
         full_row_ends = self._full_row_ends
-        full_invalid_mask = self._full_invalid_mask
-        full_topk_scores = self._full_topk_scores
-        full_topk_indices = self._full_topk_indices
         selected = self._selected
         full_groups = tuple(self._full_groups)
         full_max_context_len = self._full_max_context_len
@@ -3819,18 +3804,17 @@ class FP8PagedMQATopKWrapper(_FP8PagedMQASelectiveTopKEngine):
                     schedule_meta=schedule,
                     out=full_scores[q_begin:q_end],
                 )
-            full_scores.masked_fill_(full_invalid_mask, float("-inf"))
-            torch.topk(
+            # Consume causal lengths directly and write the stable int32 output;
+            # a dense torch.topk would scan padding and require an index copy.
+            top_k_varlen(
                 full_scores,
+                full_row_ends,
                 selected_top_k,
-                dim=1,
-                sorted=False,
-                out=(full_topk_scores, full_topk_indices),
+                out_indices=selected,
             )
-            selected.copy_(full_topk_indices)
             # Keep the fixed-width public contract for rows shorter than TopK:
             # retain every available key and fill unused slots with local key 0.
-            selected.masked_fill_(selected >= full_row_ends[:, None], 0)
+            selected.clamp_min_(0)
             return selected
 
         new_identity = _selective_logits_launch_identity(
