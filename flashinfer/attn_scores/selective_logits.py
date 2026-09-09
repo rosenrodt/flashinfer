@@ -3726,6 +3726,10 @@ class FP8PagedMQATopKWrapper(_FP8PagedMQASelectiveTopKEngine):
         self._full_max_context_len = max(row_ends)
         self._full_row_ends = torch.tensor(row_ends, dtype=torch.int32, device=q.device)
         score_columns = max(padded_context_len(self._full_max_context_len), self._top_k)
+        if self._top_k == _DEFAULT_TOP_K:
+            # Keep the native selector on its streaming, spill-free path. Logical
+            # row lengths still exclude padding from score selection.
+            score_columns = max(score_columns, 8192)
         self._full_scores = torch.empty(
             (self._rows, score_columns),
             dtype=torch.float32,
@@ -3780,6 +3784,17 @@ class FP8PagedMQATopKWrapper(_FP8PagedMQASelectiveTopKEngine):
         full_groups = tuple(self._full_groups)
         full_max_context_len = self._full_max_context_len
         selected_top_k = self._top_k
+        full_hints = None
+        if selected_top_k == _DEFAULT_TOP_K:
+            # In-range, evenly spaced hints enable the native self-sampling
+            # selector. They steer sampling, never determine the exact result.
+            # Use int64 during construction to avoid overflowing long row ends.
+            hint_columns = torch.arange(
+                selected_top_k, dtype=torch.int64, device=q.device
+            )
+            full_hints = (
+                full_row_ends[:, None] * hint_columns[None, :] // selected_top_k
+            ).to(torch.int32)
 
         def full_impl() -> torch.Tensor:
             for (
@@ -3810,6 +3825,7 @@ class FP8PagedMQATopKWrapper(_FP8PagedMQASelectiveTopKEngine):
                 full_scores,
                 full_row_ends,
                 selected_top_k,
+                pre_idx=full_hints,
                 out_indices=selected,
             )
             # Keep the fixed-width public contract for rows shorter than TopK:
