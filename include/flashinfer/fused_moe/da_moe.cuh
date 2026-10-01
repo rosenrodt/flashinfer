@@ -211,7 +211,8 @@ inline cudaError_t GetGraphNodeDependenciesView(cudaGraphNode_t node, cudaGraphN
 
 /** Copy the concrete predecessor nodes attached to one CUDA Graph node. */
 inline cudaError_t GetGraphNodeDependencies(cudaGraphNode_t node,
-                                            std::vector<cudaGraphNode_t>* dependencies) {
+                                            std::vector<cudaGraphNode_t>* dependencies,
+                                            bool full_completion_only = false) {
   size_t num_dependencies = 0;
   cudaError_t status = GetGraphNodeDependenciesView(node, nullptr, nullptr, &num_dependencies);
   if (status != cudaSuccess) {
@@ -223,8 +224,21 @@ inline cudaError_t GetGraphNodeDependencies(cudaGraphNode_t node,
   }
   // PDL edges require metadata; omitting it makes CUDA reject a lossy query.
   std::vector<cudaGraphEdgeData> edge_data(num_dependencies);
-  return GetGraphNodeDependenciesView(node, dependencies->data(), edge_data.data(),
-                                      &num_dependencies);
+  status =
+      GetGraphNodeDependenciesView(node, dependencies->data(), edge_data.data(), &num_dependencies);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  size_t kept = 0;
+  for (size_t i = 0; i < num_dependencies; ++i) {
+    // Trigger dependencies do not prove completion before workspace reuse.
+    if (!full_completion_only || (edge_data[i].type == cudaGraphDependencyTypeDefault &&
+                                  edge_data[i].from_port == 0 && edge_data[i].to_port == 0)) {
+      (*dependencies)[kept++] = (*dependencies)[i];
+    }
+  }
+  dependencies->resize(kept);
+  return cudaSuccess;
 }
 
 /** Return whether two dependency lists contain the same concrete graph nodes. */
@@ -236,7 +250,7 @@ inline bool HaveSameGraphDependencies(const std::vector<cudaGraphNode_t>& first,
 
 /** Return whether one graph node is equal to or transitively depends on an ancestor. */
 inline cudaError_t GraphNodeDependsOn(cudaGraphNode_t node, cudaGraphNode_t ancestor,
-                                      bool* depends_on) {
+                                      bool* depends_on, bool full_completion_only = true) {
   if (node == ancestor) {
     *depends_on = true;
     return cudaSuccess;
@@ -251,7 +265,7 @@ inline cudaError_t GraphNodeDependsOn(cudaGraphNode_t node, cudaGraphNode_t ance
     }
     visited.push_back(current);
     std::vector<cudaGraphNode_t> dependencies;
-    cudaError_t status = GetGraphNodeDependencies(current, &dependencies);
+    cudaError_t status = GetGraphNodeDependencies(current, &dependencies, full_completion_only);
     if (status != cudaSuccess) {
       return status;
     }
@@ -295,6 +309,34 @@ inline cudaError_t ValidateWorkspaceLaneSequence(const ActiveCaptureContext& con
     }
   }
   *is_serialized = false;
+  return cudaSuccess;
+}
+
+/** Strengthen ordered PDL ancestry with a full-completion workspace dependency. */
+inline cudaError_t PrepareWorkspaceLaneSequence(ActiveCaptureContext* context,
+                                                unsigned long long expected_capture_id,
+                                                cudaGraphNode_t previous_conditional_node,
+                                                bool* is_serialized) {
+  cudaError_t status = ValidateWorkspaceLaneSequence(*context, expected_capture_id,
+                                                     previous_conditional_node, is_serialized);
+  if (status != cudaSuccess || *is_serialized || expected_capture_id == 0 ||
+      previous_conditional_node == nullptr || context->capture_id != expected_capture_id) {
+    return status;
+  }
+  // Preserve fallback for unordered forks. A PDL trigger path proves ancestry, not completion;
+  // add an ordinary dependency before either next invocation root may touch the shared lane.
+  for (cudaGraphNode_t dependency : context->dependencies) {
+    bool is_descendant = false;
+    status = GraphNodeDependsOn(dependency, previous_conditional_node, &is_descendant, false);
+    if (status != cudaSuccess) {
+      return status;
+    }
+    if (is_descendant) {
+      context->dependencies.push_back(previous_conditional_node);
+      *is_serialized = true;
+      return cudaSuccess;
+    }
+  }
   return cudaSuccess;
 }
 

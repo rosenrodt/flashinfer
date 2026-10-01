@@ -6392,8 +6392,8 @@ Array<int64_t> trtllm_moe_inspect_da_workspace_lane(TensorView device_anchor,
   TVM_FFI_ICHECK(context.status == cudaStreamCaptureStatusActive && context.graph != nullptr)
       << "DA workspace-lane inspection requires an active outer CUDA Graph capture.";
   bool is_serialized = false;
-  CHECK_CUDA_ERROR(da_moe::ValidateWorkspaceLaneSequence(
-      context, static_cast<unsigned long long>(expected_capture_id),
+  CHECK_CUDA_ERROR(da_moe::PrepareWorkspaceLaneSequence(
+      &context, static_cast<unsigned long long>(expected_capture_id),
       reinterpret_cast<cudaGraphNode_t>(previous_conditional_node_handle), &is_serialized));
   return {static_cast<int64_t>(context.capture_id), static_cast<int64_t>(is_serialized)};
 }
@@ -6423,12 +6423,14 @@ Array<int64_t> trtllm_moe_begin_da_switch_capture(
   TVM_FFI_ICHECK(original.status == cudaStreamCaptureStatusActive && original.graph != nullptr)
       << "DA SWITCH injection requires an active outer CUDA Graph capture.";
   bool is_workspace_lane_serialized = false;
-  CHECK_CUDA_ERROR(da_moe::ValidateWorkspaceLaneSequence(
-      original, static_cast<unsigned long long>(expected_capture_id),
+  CHECK_CUDA_ERROR(da_moe::PrepareWorkspaceLaneSequence(
+      &original, static_cast<unsigned long long>(expected_capture_id),
       reinterpret_cast<cudaGraphNode_t>(previous_conditional_node_handle),
       &is_workspace_lane_serialized));
   TVM_FFI_ICHECK(is_workspace_lane_serialized)
       << "DA workspace lane is not ordered after its previous invocation.";
+  CHECK_CUDA_ERROR(da_moe::SetCaptureDependencies(stream, original.dependencies.data(),
+                                                  original.dependencies.size()));
 
   // Dispatch the fused preamble first, then rewind the capture frontier to create a sibling root.
   auto const routing_metadata =

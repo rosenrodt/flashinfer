@@ -58,6 +58,30 @@ int main() {
   Check(flashinfer::da_moe::GetGraphNodeDependencies(trigger_only, &dependencies));
   Require(dependencies.size() == 1 && dependencies[0] == ancestor,
           "metadata-aware query must preserve a programmatic predecessor");
+  bool depends_on = true;
+  Check(flashinfer::da_moe::GraphNodeDependsOn(trigger_only, ancestor, &depends_on));
+  Require(!depends_on, "programmatic trigger must not prove workspace serialization");
+  Check(flashinfer::da_moe::GraphNodeDependsOn(completed, ancestor, &depends_on));
+  Require(depends_on, "full-completion edge must prove workspace serialization");
+  flashinfer::da_moe::ActiveCaptureContext context{};
+  context.capture_id = 42;
+  context.graph = graph;
+  context.dependencies = {trigger_only};
+  Check(flashinfer::da_moe::PrepareWorkspaceLaneSequence(&context, 42, ancestor, &depends_on));
+  Require(depends_on && context.dependencies.size() == 2 && context.dependencies.back() == ancestor,
+          "ordered PDL ancestry must acquire an explicit full-completion dependency");
+  Check(flashinfer::da_moe::ValidateWorkspaceLaneSequence(context, 42, ancestor, &depends_on));
+  Require(depends_on, "strengthened frontier must prove full-completion workspace ordering");
+  cudaGraphNode_t unrelated;
+  Check(cudaGraphAddKernelNode(&unrelated, graph, nullptr, 0, &params));
+  context.dependencies = {unrelated};
+  Check(flashinfer::da_moe::PrepareWorkspaceLaneSequence(&context, 42, ancestor, &depends_on));
+  Require(!depends_on && context.dependencies.size() == 1,
+          "unordered fork must remain rejected without frontier mutation");
+  context.dependencies = {trigger_only};
+  Check(flashinfer::da_moe::PrepareWorkspaceLaneSequence(&context, 43, ancestor, &depends_on));
+  Require(!depends_on && context.dependencies.size() == 1,
+          "cross-generation lane must remain rejected");
   Check(cudaGraphDestroy(graph));
-  std::puts("PASS: metadata-aware graph dependencies");
+  std::puts("PASS: metadata query and conservative PDL workspace ordering");
 }
