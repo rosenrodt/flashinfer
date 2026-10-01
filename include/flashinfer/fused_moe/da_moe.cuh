@@ -200,11 +200,12 @@ inline cudaError_t GetGraphEdgeCount(cudaGraph_t graph, size_t* edge_count) {
 
 /** Read the concrete predecessor nodes attached to one CUDA Graph node. */
 inline cudaError_t GetGraphNodeDependenciesView(cudaGraphNode_t node, cudaGraphNode_t* dependencies,
+                                                cudaGraphEdgeData* edge_data,
                                                 size_t* num_dependencies) {
 #if CUDART_VERSION >= 13000
-  return cudaGraphNodeGetDependencies(node, dependencies, nullptr, num_dependencies);
+  return cudaGraphNodeGetDependencies(node, dependencies, edge_data, num_dependencies);
 #else
-  return cudaGraphNodeGetDependencies(node, dependencies, num_dependencies);
+  return cudaGraphNodeGetDependencies_v2(node, dependencies, edge_data, num_dependencies);
 #endif
 }
 
@@ -212,7 +213,7 @@ inline cudaError_t GetGraphNodeDependenciesView(cudaGraphNode_t node, cudaGraphN
 inline cudaError_t GetGraphNodeDependencies(cudaGraphNode_t node,
                                             std::vector<cudaGraphNode_t>* dependencies) {
   size_t num_dependencies = 0;
-  cudaError_t status = GetGraphNodeDependenciesView(node, nullptr, &num_dependencies);
+  cudaError_t status = GetGraphNodeDependenciesView(node, nullptr, nullptr, &num_dependencies);
   if (status != cudaSuccess) {
     return status;
   }
@@ -220,7 +221,10 @@ inline cudaError_t GetGraphNodeDependencies(cudaGraphNode_t node,
   if (num_dependencies == 0) {
     return cudaSuccess;
   }
-  return GetGraphNodeDependenciesView(node, dependencies->data(), &num_dependencies);
+  // PDL edges require metadata; omitting it makes CUDA reject a lossy query.
+  std::vector<cudaGraphEdgeData> edge_data(num_dependencies);
+  return GetGraphNodeDependenciesView(node, dependencies->data(), edge_data.data(),
+                                      &num_dependencies);
 }
 
 /** Return whether two dependency lists contain the same concrete graph nodes. */
