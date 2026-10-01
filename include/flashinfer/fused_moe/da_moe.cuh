@@ -340,6 +340,26 @@ inline cudaError_t PrepareWorkspaceLaneSequence(ActiveCaptureContext* context,
   return cudaSuccess;
 }
 
+/** Identify one newly launched root even when CUDA retains older frontier nodes. */
+inline cudaError_t GetNewCaptureFrontierNode(const ActiveCaptureContext& before,
+                                             const ActiveCaptureContext& after,
+                                             cudaGraphNode_t* node) {
+  *node = nullptr;
+  if (before.capture_id != after.capture_id || before.graph != after.graph) {
+    return cudaErrorInvalidValue;
+  }
+  for (cudaGraphNode_t dependency : after.dependencies) {
+    if (std::find(before.dependencies.begin(), before.dependencies.end(), dependency) ==
+        before.dependencies.end()) {
+      if (*node != nullptr) {
+        return cudaErrorInvalidValue;
+      }
+      *node = dependency;
+    }
+  }
+  return *node == nullptr ? cudaErrorInvalidValue : cudaSuccess;
+}
+
 /** Snapshot the active stream capture graph and its current dependency frontier. */
 inline cudaError_t GetActiveCaptureContext(cudaStream_t stream, ActiveCaptureContext* context) {
   const cudaGraphNode_t* dependency_view = nullptr;

@@ -82,6 +82,12 @@ int main() {
   Check(flashinfer::da_moe::PrepareWorkspaceLaneSequence(&context, 43, ancestor, &depends_on));
   Require(!depends_on && context.dependencies.size() == 1,
           "cross-generation lane must remain rejected");
+  auto after = context;
+  after.dependencies = {completed, trigger_only};
+  cudaGraphNode_t new_node = nullptr;
+  Check(flashinfer::da_moe::GetNewCaptureFrontierNode(context, after, &new_node));
+  Require(new_node == completed,
+          "new root must be selected independently of retained frontier ordering");
   Check(cudaGraphDestroy(graph));
   std::puts("PASS: metadata query and conservative PDL workspace ordering");
 }
